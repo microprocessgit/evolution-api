@@ -8,6 +8,7 @@ import ChatwootClient, {
   inbox,
 } from '@figuro/chatwoot-sdk';
 import { request as chatwootRequest } from '@figuro/chatwoot-sdk/dist/core/request';
+import { proto } from '@whiskeysockets/baileys';
 import axios from 'axios';
 import FormData from 'form-data';
 import { createReadStream, unlinkSync, writeFileSync } from 'fs';
@@ -85,12 +86,14 @@ export class ChatwootService {
     return client;
   }
 
-  public getClientCwConfig(): ChatwootAPIConfig {
+  public getClientCwConfig(): ChatwootAPIConfig & { name_inbox: string; merge_brazil_contacts: boolean } {
     return {
       basePath: this.provider.url,
       with_credentials: true,
       credentials: 'include',
       token: this.provider.token,
+      name_inbox: this.provider.name_inbox,
+      merge_brazil_contacts: this.provider.merge_brazil_contacts,
     };
   }
 
@@ -110,7 +113,7 @@ export class ChatwootService {
 
       await this.initInstanceChatwoot(
         instance,
-        instance.instanceName.split('-cwId-')[0],
+        data.name_inbox ?? instance.instanceName.split('-cwId-')[0],
         `${urlServer}/chatwoot/webhook/${encodeURIComponent(instance.instanceName)}`,
         true,
         data.number,
@@ -416,9 +419,48 @@ export class ChatwootService {
     }
   }
 
+  private async mergeBrazilianContacts(contacts: any[]) {
+    try {
+      //sdk chatwoot não tem função merge
+      this.logger.verbose('merging contacts');
+      const contact = await chatwootRequest(this.getClientCwConfig(), {
+        method: 'POST',
+        url: `/api/v1/accounts/${this.provider.account_id}/actions/contact_merge`,
+        body: {
+          base_contact_id: contacts.find((contact) => contact.phone_number.length === 14)?.id,
+          mergee_contact_id: contacts.find((contact) => contact.phone_number.length === 13)?.id,
+        },
+      });
+
+      return contact;
+    } catch {
+      this.logger.error('Error merging contacts');
+      return null;
+    }
+  }
+
   private findContactInContactList(contacts: any[], query: string) {
     const phoneNumbers = this.getNumbers(query);
     const searchableFields = this.getSearchableFields();
+
+    // eslint-disable-next-line prettier/prettier
+    if(contacts.length === 2 && this.getClientCwConfig().merge_brazil_contacts && query.startsWith('+55')){
+
+      const contact = this.mergeBrazilianContacts(contacts);
+      if (contact) {
+        return contact;
+      }
+    }
+
+    const phone = phoneNumbers.reduce(
+      (savedNumber, number) => (number.length > savedNumber.length ? number : savedNumber),
+      '',
+    );
+
+    const contact_with9 = contacts.find((contact) => contact.phone_number === phone);
+    if (contact_with9) {
+      return contact_with9;
+    }
 
     for (const contact of contacts) {
       for (const field of searchableFields) {
@@ -447,7 +489,7 @@ export class ChatwootService {
   }
 
   private getSearchableFields() {
-    return ['phone_number', 'identifier'];
+    return ['phone_number'];
   }
 
   private getFilterPayload(query: string) {
@@ -461,7 +503,7 @@ export class ChatwootService {
         const queryOperator = fieldsToSearch.length - 1 === index1 && numbers.length - 1 === index2 ? null : 'OR';
         filterPayload.push({
           attribute_key: field,
-          filter_operator: ['phone_number', 'identifier'].includes(field) ? 'equal_to' : 'contains',
+          filter_operator: 'equal_to',
           values: [number.replace('+', '')],
           query_operator: queryOperator,
         });
@@ -559,53 +601,44 @@ export class ChatwootService {
 
       const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(chatId);
 
-      const findContact = await this.findContact(instance, chatId);
+      let contact = await this.findContact(instance, chatId);
 
-      let contact: any;
-      if (body.key.fromMe) {
-        if (findContact) {
-          contact = await this.updateContact(instance, findContact.id, {
-            avatar_url: picture_url.profilePictureUrl || null,
-          });
-        } else {
-          const jid = isGroup ? null : body.key.remoteJid;
-          contact = await this.createContact(
-            instance,
-            chatId,
-            filterInbox.id,
-            isGroup,
-            nameContact,
-            picture_url.profilePictureUrl || null,
-            jid,
-          );
+      if (contact) {
+        if (!body.key.fromMe) {
+          const waProfilePictureFile =
+            picture_url?.profilePictureUrl?.split('#')[0].split('?')[0].split('/').pop() || '';
+          const chatwootProfilePictureFile = contact?.thumbnail?.split('#')[0].split('?')[0].split('/').pop() || '';
+          const pictureNeedsUpdate = waProfilePictureFile !== chatwootProfilePictureFile;
+          const nameNeedsUpdate =
+            !contact.name ||
+            contact.name === chatId ||
+            (`+${chatId}`.startsWith('+55')
+              ? this.getNumbers(`+${chatId}`).some(
+                  (v) => contact.name === v || contact.name === v.substring(3) || contact.name === v.substring(1),
+                )
+              : false);
+
+          const contactNeedsUpdate = pictureNeedsUpdate || nameNeedsUpdate;
+          if (contactNeedsUpdate) {
+            this.logger.verbose('update contact in chatwoot');
+            contact = await this.updateContact(instance, contact.id, {
+              ...(nameNeedsUpdate && { name: nameContact }),
+              ...(waProfilePictureFile === '' && { avatar: null }),
+              ...(pictureNeedsUpdate && { avatar_url: picture_url?.profilePictureUrl }),
+            });
+          }
         }
       } else {
-        if (findContact) {
-          if (!findContact.name || findContact.name === chatId) {
-            contact = await this.updateContact(instance, findContact.id, {
-              name: nameContact,
-              avatar_url: picture_url.profilePictureUrl || null,
-            });
-          } else {
-            contact = await this.updateContact(instance, findContact.id, {
-              avatar_url: picture_url.profilePictureUrl || null,
-            });
-          }
-          if (!contact) {
-            contact = await this.findContact(instance, chatId);
-          }
-        } else {
-          const jid = isGroup ? null : body.key.remoteJid;
-          contact = await this.createContact(
-            instance,
-            chatId,
-            filterInbox.id,
-            isGroup,
-            nameContact,
-            picture_url.profilePictureUrl || null,
-            jid,
-          );
-        }
+        const jid = isGroup ? null : body.key.remoteJid;
+        contact = await this.createContact(
+          instance,
+          chatId,
+          filterInbox.id,
+          isGroup,
+          nameContact,
+          picture_url.profilePictureUrl || null,
+          jid,
+        );
       }
 
       if (!contact) {
@@ -615,20 +648,13 @@ export class ChatwootService {
 
       const contactId = contact?.payload?.id || contact?.payload?.contact?.id || contact?.id;
 
-      if (!body.key.fromMe && contact.name === chatId && nameContact !== chatId) {
-        this.logger.verbose('update contact name in chatwoot');
-        await this.updateContact(instance, contactId, {
-          name: nameContact,
-        });
-      }
-
       this.logger.verbose('get contact conversations in chatwoot');
       const contactConversations = (await client.contacts.listConversations({
         accountId: this.provider.account_id,
         id: contactId,
       })) as any;
 
-      if (contactConversations) {
+      if (contactConversations?.payload?.length) {
         let conversation: any;
         if (this.provider.reopen_conversation) {
           conversation = contactConversations.payload.find((conversation) => conversation.inbox_id == filterInbox.id);
@@ -710,7 +736,7 @@ export class ChatwootService {
     }
 
     this.logger.verbose('find inbox by name');
-    const findByName = inbox.payload.find((inbox) => inbox.name === instance.instanceName.split('-cwId-')[0]);
+    const findByName = inbox.payload.find((inbox) => inbox.name === this.getClientCwConfig().name_inbox);
 
     if (!findByName) {
       this.logger.warn('inbox not found');
@@ -787,26 +813,15 @@ export class ChatwootService {
       return null;
     }
 
-    const payload = [
-      ['inbox_id', inbox.id.toString()],
-      ['contact_id', contact.id.toString()],
-      ['status', 'open'],
-    ];
+    const conversations = (await client.contacts.listConversations({
+      accountId: this.provider.account_id,
+      id: contact.id,
+    })) as any;
 
     return (
-      (
-        (await client.conversations.filter({
-          accountId: this.provider.account_id,
-          payload: payload.map((item, i, payload) => {
-            return {
-              attribute_key: item[0],
-              filter_operator: 'equal_to',
-              values: [item[1]],
-              query_operator: i < payload.length - 1 ? 'AND' : null,
-            };
-          }),
-        })) as { payload: conversation[] }
-      ).payload[0] || undefined
+      conversations.payload.find(
+        (conversation) => conversation.inbox_id === inbox.id && conversation.status === 'open',
+      ) || undefined
     );
   }
 
@@ -1106,6 +1121,26 @@ export class ChatwootService {
     }
   }
 
+  public async onSendMessageError(instance: InstanceDto, conversation: number, error?: string) {
+    const client = await this.clientCw(instance);
+
+    if (!client) {
+      return;
+    }
+
+    client.messages.create({
+      accountId: this.provider.account_id,
+      conversationId: conversation,
+      data: {
+        content: i18next.t('cw.message.notsent', {
+          error: error?.length > 0 ? `_${error}_` : '',
+        }),
+        message_type: 'outgoing',
+        private: true,
+      },
+    });
+  }
+
   public async receiveWebhook(instance: InstanceDto, body: any) {
     try {
       await new Promise((resolve) => setTimeout(resolve, 500));
@@ -1274,6 +1309,11 @@ export class ChatwootService {
           return { message: 'bot' };
         }
 
+        if (!waInstance && body.conversation?.id) {
+          this.onSendMessageError(instance, body.conversation?.id, 'Instance not found');
+          return { message: 'bot' };
+        }
+
         this.logger.verbose('Format message to send');
         let formatText: string;
         if (senderName === null || senderName === undefined) {
@@ -1310,6 +1350,9 @@ export class ChatwootService {
                 formatText,
                 options,
               );
+              if (!messageSent && body.conversation?.id) {
+                this.onSendMessageError(instance, body.conversation?.id);
+              }
 
               this.updateChatwootMessageId(
                 {
@@ -1343,23 +1386,34 @@ export class ChatwootService {
               },
             };
 
-            const messageSent = await waInstance?.textMessage(data, true);
+            let messageSent: MessageRaw | proto.WebMessageInfo;
+            try {
+              messageSent = await waInstance?.textMessage(data, true);
+              if (!messageSent) {
+                throw new Error('Message not sent');
+              }
 
-            this.updateChatwootMessageId(
-              {
-                ...messageSent,
-                owner: instance.instanceName,
-              },
-              {
-                messageId: body.id,
-                inboxId: body.inbox?.id,
-                conversationId: body.conversation?.id,
-                contactInbox: {
-                  sourceId: body.conversation?.contact_inbox?.source_id,
+              this.updateChatwootMessageId(
+                {
+                  ...messageSent,
+                  owner: instance.instanceName,
                 },
-              },
-              instance,
-            );
+                {
+                  messageId: body.id,
+                  inboxId: body.inbox?.id,
+                  conversationId: body.conversation?.id,
+                  contactInbox: {
+                    sourceId: body.conversation?.contact_inbox?.source_id,
+                  },
+                },
+                instance,
+              );
+            } catch (error) {
+              if (!messageSent && body.conversation?.id) {
+                this.onSendMessageError(instance, body.conversation?.id, error.toString());
+              }
+              throw error;
+            }
           }
         }
 

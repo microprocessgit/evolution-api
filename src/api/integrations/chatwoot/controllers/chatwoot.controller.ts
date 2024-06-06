@@ -53,11 +53,15 @@ export class ChatwootController {
       data.conversation_pending = false;
       data.import_contacts = false;
       data.import_messages = false;
+      data.merge_brazil_contacts = false;
       data.days_limit_import_messages = 0;
       data.auto_create = false;
+      data.name_inbox = '';
     }
 
-    data.name_inbox = instance.instanceName;
+    if (!data.name_inbox || data.name_inbox === '') {
+      data.name_inbox = instance.instanceName;
+    }
 
     const result = await this.chatwootService.create(instance, data);
 

@@ -3,9 +3,9 @@ import { isURL } from 'class-validator';
 import EventEmitter2 from 'eventemitter2';
 import { v4 } from 'uuid';
 
-import { ConfigService, HttpServer, WaBusiness } from '../../config/env.config';
+import { Auth, ConfigService, HttpServer, WaBusiness } from '../../config/env.config';
 import { Logger } from '../../config/logger.config';
-import { BadRequestException, InternalServerErrorException } from '../../exceptions';
+import { BadRequestException, InternalServerErrorException, UnauthorizedException } from '../../exceptions';
 import { InstanceDto, SetPresenceDto } from '../dto/instance.dto';
 import { ChatwootService } from '../integrations/chatwoot/services/chatwoot.service';
 import { RabbitmqService } from '../integrations/rabbitmq/services/rabbitmq.service';
@@ -15,12 +15,12 @@ import { WebsocketService } from '../integrations/websocket/services/websocket.s
 import { RepositoryBroker } from '../repository/repository.manager';
 import { AuthService, OldToken } from '../services/auth.service';
 import { CacheService } from '../services/cache.service';
+import { BaileysStartupService } from '../services/channels/whatsapp.baileys.service';
+import { BusinessStartupService } from '../services/channels/whatsapp.business.service';
 import { IntegrationService } from '../services/integration.service';
 import { WAMonitoringService } from '../services/monitor.service';
 import { SettingsService } from '../services/settings.service';
 import { WebhookService } from '../services/webhook.service';
-import { BaileysStartupService } from '../services/whatsapp/whatsapp.baileys.service';
-import { BusinessStartupService } from '../services/whatsapp/whatsapp.business.service';
 import { Events, Integration, wa } from '../types/wa.types';
 import { ProxyController } from './proxy.controller';
 
@@ -65,6 +65,8 @@ export class InstanceController {
     chatwoot_reopen_conversation,
     chatwoot_conversation_pending,
     chatwoot_import_contacts,
+    chatwoot_name_inbox,
+    chatwoot_merge_brazil_contacts,
     chatwoot_import_messages,
     chatwoot_days_limit_import_messages,
     reject_call,
@@ -513,11 +515,12 @@ export class InstanceController {
           token: chatwoot_token,
           url: chatwoot_url,
           sign_msg: chatwoot_sign_msg || false,
-          name_inbox: instance.instanceName.split('-cwId-')[0],
+          name_inbox: chatwoot_name_inbox ?? instance.instanceName.split('-cwId-')[0],
           number,
           reopen_conversation: chatwoot_reopen_conversation || false,
           conversation_pending: chatwoot_conversation_pending || false,
           import_contacts: chatwoot_import_contacts ?? true,
+          merge_brazil_contacts: chatwoot_merge_brazil_contacts ?? false,
           import_messages: chatwoot_import_messages ?? true,
           days_limit_import_messages: chatwoot_days_limit_import_messages ?? 60,
           auto_create: true,
@@ -573,11 +576,12 @@ export class InstanceController {
           sign_msg: chatwoot_sign_msg || false,
           reopen_conversation: chatwoot_reopen_conversation || false,
           conversation_pending: chatwoot_conversation_pending || false,
+          merge_brazil_contacts: chatwoot_merge_brazil_contacts ?? false,
           import_contacts: chatwoot_import_contacts ?? true,
           import_messages: chatwoot_import_messages ?? true,
           days_limit_import_messages: chatwoot_days_limit_import_messages || 60,
           number,
-          name_inbox: instance.instanceName,
+          name_inbox: chatwoot_name_inbox ?? instance.instanceName,
           webhook_url: `${urlServer}/chatwoot/webhook/${encodeURIComponent(instance.instanceName)}`,
         },
       };
@@ -675,11 +679,26 @@ export class InstanceController {
     };
   }
 
-  public async fetchInstances({ instanceName, instanceId, number }: InstanceDto) {
-    if (instanceName) {
-      this.logger.verbose('requested fetchInstances from ' + instanceName + ' instance');
-      this.logger.verbose('instanceName: ' + instanceName);
-      return this.waMonitor.instanceInfo(instanceName);
+  public async fetchInstances({ instanceName, instanceId, number }: InstanceDto, key: string) {
+    const env = this.configService.get<Auth>('AUTHENTICATION').API_KEY;
+
+    let name = instanceName;
+    let arrayReturn = false;
+
+    if (env.KEY !== key) {
+      const instanceByKey = await this.repository.auth.findByKey(key);
+      if (instanceByKey) {
+        name = instanceByKey._id;
+        arrayReturn = true;
+      } else {
+        throw new UnauthorizedException();
+      }
+    }
+
+    if (name) {
+      this.logger.verbose('requested fetchInstances from ' + name + ' instance');
+      this.logger.verbose('instanceName: ' + name);
+      return this.waMonitor.instanceInfo(name, arrayReturn);
     } else if (instanceId || number) {
       return this.waMonitor.instanceInfoById(instanceId, number);
     }

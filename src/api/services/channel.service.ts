@@ -13,6 +13,7 @@ import {
   Database,
   HttpServer,
   Log,
+  Rabbitmq,
   Sqs,
   Webhook,
   Websocket,
@@ -38,17 +39,17 @@ import { waMonitor } from '../server.module';
 import { Events, wa } from '../types/wa.types';
 import { CacheService } from './cache.service';
 
-export class WAStartupService {
+export class ChannelStartupService {
   constructor(
     public readonly configService: ConfigService,
     public readonly eventEmitter: EventEmitter2,
     public readonly repository: RepositoryBroker,
     public readonly chatwootCache: CacheService,
   ) {
-    this.logger.verbose('WAStartupService initialized');
+    this.logger.verbose('ChannelStartupService initialized');
   }
 
-  public readonly logger = new Logger(WAStartupService.name);
+  public readonly logger = new Logger(ChannelStartupService.name);
 
   public client: WASocket;
   public readonly instance: wa.Instance = {};
@@ -136,11 +137,13 @@ export class WAStartupService {
 
   public async findIntegration() {
     this.logger.verbose('Finding integration');
-    const data = await this.repository.integration.find(this.instanceName);
+    let data: any;
+
+    data = await this.repository.integration.find(this.instanceName);
 
     if (!data) {
-      this.logger.verbose('Integration not found');
-      throw new NotFoundException('Integration not found');
+      this.repository.integration.create({ integration: 'WHATSAPP-BAILEYS', number: '', token: '' }, this.instanceName);
+      data = { integration: 'WHATSAPP-BAILEYS', number: '', token: '' };
     }
 
     this.logger.verbose(`Integration: ${data.integration}`);
@@ -303,6 +306,9 @@ export class WAStartupService {
     this.localChatwoot.conversation_pending = data?.conversation_pending;
     this.logger.verbose(`Chatwoot conversation pending: ${this.localChatwoot.conversation_pending}`);
 
+    this.localChatwoot.merge_brazil_contacts = data?.merge_brazil_contacts;
+    this.logger.verbose(`Chatwoot merge brazil contacts: ${this.localChatwoot.merge_brazil_contacts}`);
+
     this.localChatwoot.import_contacts = data?.import_contacts;
     this.logger.verbose(`Chatwoot import contacts: ${this.localChatwoot.import_contacts}`);
 
@@ -326,6 +332,7 @@ export class WAStartupService {
     this.logger.verbose(`Chatwoot sign delimiter: ${data.sign_delimiter}`);
     this.logger.verbose(`Chatwoot reopen conversation: ${data.reopen_conversation}`);
     this.logger.verbose(`Chatwoot conversation pending: ${data.conversation_pending}`);
+    this.logger.verbose(`Chatwoot merge brazil contacts: ${data.merge_brazil_contacts}`);
     this.logger.verbose(`Chatwoot import contacts: ${data.import_contacts}`);
     this.logger.verbose(`Chatwoot import messages: ${data.import_messages}`);
     this.logger.verbose(`Chatwoot days limit import messages: ${data.days_limit_import_messages}`);
@@ -354,6 +361,7 @@ export class WAStartupService {
     this.logger.verbose(`Chatwoot sign delimiter: ${data.sign_delimiter}`);
     this.logger.verbose(`Chatwoot reopen conversation: ${data.reopen_conversation}`);
     this.logger.verbose(`Chatwoot conversation pending: ${data.conversation_pending}`);
+    this.logger.verbose(`Chatwoot merge brazilian contacts: ${data.merge_brazil_contacts}`);
     this.logger.verbose(`Chatwoot import contacts: ${data.import_contacts}`);
     this.logger.verbose(`Chatwoot import messages: ${data.import_messages}`);
     this.logger.verbose(`Chatwoot days limit import messages: ${data.days_limit_import_messages}`);
@@ -368,6 +376,7 @@ export class WAStartupService {
       sign_delimiter: data.sign_delimiter || null,
       reopen_conversation: data.reopen_conversation,
       conversation_pending: data.conversation_pending,
+      merge_brazil_contacts: data.merge_brazil_contacts,
       import_contacts: data.import_contacts,
       import_messages: data.import_messages,
       days_limit_import_messages: data.days_limit_import_messages,
@@ -684,6 +693,9 @@ export class WAStartupService {
     const rabbitmqLocal = this.localRabbitmq.events;
     const sqsLocal = this.localSqs.events;
     const serverUrl = this.configService.get<HttpServer>('SERVER').URL;
+    const rabbitmqEnabled = this.configService.get<Rabbitmq>('RABBITMQ').ENABLED;
+    const rabbitmqGlobal = this.configService.get<Rabbitmq>('RABBITMQ').GLOBAL_ENABLED;
+    const rabbitmqEvents = this.configService.get<Rabbitmq>('RABBITMQ').EVENTS;
     const we = event.replace(/[.-]/gm, '_').toUpperCase();
     const transformedWe = we.replace(/_/gm, '-').toLowerCase();
     const tzoffset = new Date().getTimezoneOffset() * 60000; //offset in milliseconds
@@ -694,67 +706,134 @@ export class WAStartupService {
     const tokenStore = await this.repository.auth.find(this.instanceName);
     const instanceApikey = tokenStore?.apikey || 'Apikey not found';
 
-    if (this.localRabbitmq.enabled) {
+    if (rabbitmqEnabled) {
       const amqp = getAMQP();
-
-      if (amqp) {
+      if (this.localRabbitmq.enabled && amqp) {
         if (Array.isArray(rabbitmqLocal) && rabbitmqLocal.includes(we)) {
           const exchangeName = this.instanceName ?? 'evolution_exchange';
 
-          // await amqp.assertExchange(exchangeName, 'topic', {
-          //   durable: true,
-          //   autoDelete: false,
-          // });
+          let retry = 0;
 
-          await this.assertExchangeAsync(amqp, exchangeName, 'topic', {
-            durable: true,
-            autoDelete: false,
-          });
+          while (retry < 3) {
+            try {
+              await amqp.assertExchange(exchangeName, 'topic', {
+                durable: true,
+                autoDelete: false,
+              });
 
-          const queueName = `${this.instanceName}.${event}`;
+              const queueName = `${this.instanceName}.${event}`;
 
-          await amqp.assertQueue(queueName, {
-            durable: true,
-            autoDelete: false,
-            arguments: {
-              'x-queue-type': 'quorum',
-            },
-          });
+              await amqp.assertQueue(queueName, {
+                durable: true,
+                autoDelete: false,
+                arguments: {
+                  'x-queue-type': 'quorum',
+                },
+              });
 
-          await amqp.bindQueue(queueName, exchangeName, event);
+              await amqp.bindQueue(queueName, exchangeName, event);
 
-          const message = {
-            event,
-            instance: this.instance.name,
-            data,
-            server_url: serverUrl,
-            date_time: now,
-            sender: this.wuid,
-          };
+              const message = {
+                event,
+                instance: this.instance.name,
+                data,
+                server_url: serverUrl,
+                date_time: now,
+                sender: this.wuid,
+              };
 
-          if (expose && instanceApikey) {
-            message['apikey'] = instanceApikey;
+              if (expose && instanceApikey) {
+                message['apikey'] = instanceApikey;
+              }
+
+              await amqp.publish(exchangeName, event, Buffer.from(JSON.stringify(message)));
+
+              if (this.configService.get<Log>('LOG').LEVEL.includes('WEBHOOKS')) {
+                const logData = {
+                  local: ChannelStartupService.name + '.sendData-RabbitMQ',
+                  event,
+                  instance: this.instance.name,
+                  data,
+                  server_url: serverUrl,
+                  apikey: (expose && instanceApikey) || null,
+                  date_time: now,
+                  sender: this.wuid,
+                };
+
+                if (expose && instanceApikey) {
+                  logData['apikey'] = instanceApikey;
+                }
+
+                this.logger.log(logData);
+              }
+              break;
+            } catch (error) {
+              retry++;
+            }
           }
+        }
+      }
 
-          await amqp.publish(exchangeName, event, Buffer.from(JSON.stringify(message)));
+      if (rabbitmqGlobal && rabbitmqEvents[we] && amqp) {
+        const exchangeName = 'evolution_exchange';
 
-          if (this.configService.get<Log>('LOG').LEVEL.includes('WEBHOOKS')) {
-            const logData = {
-              local: WAStartupService.name + '.sendData-RabbitMQ',
+        let retry = 0;
+
+        while (retry < 3) {
+          try {
+            await amqp.assertExchange(exchangeName, 'topic', {
+              durable: true,
+              autoDelete: false,
+            });
+
+            const queueName = transformedWe;
+
+            await amqp.assertQueue(queueName, {
+              durable: true,
+              autoDelete: false,
+              arguments: {
+                'x-queue-type': 'quorum',
+              },
+            });
+
+            await amqp.bindQueue(queueName, exchangeName, event);
+
+            const message = {
               event,
               instance: this.instance.name,
               data,
               server_url: serverUrl,
-              apikey: (expose && instanceApikey) || null,
               date_time: now,
               sender: this.wuid,
             };
 
             if (expose && instanceApikey) {
-              logData['apikey'] = instanceApikey;
+              message['apikey'] = instanceApikey;
+            }
+            await amqp.publish(exchangeName, event, Buffer.from(JSON.stringify(message)));
+
+            if (this.configService.get<Log>('LOG').LEVEL.includes('WEBHOOKS')) {
+              const logData = {
+                local: ChannelStartupService.name + '.sendData-RabbitMQ-Global',
+                event,
+                instance: this.instance.name,
+                data,
+                server_url: serverUrl,
+                apikey: (expose && instanceApikey) || null,
+                date_time: now,
+                sender: this.wuid,
+              };
+
+              if (expose && instanceApikey) {
+                logData['apikey'] = instanceApikey;
+              }
+
+              this.logger.log(logData);
             }
 
-            this.logger.log(logData);
+            break;
+          } catch (error) {
+            retry++;
           }
         }
       }
@@ -796,7 +875,7 @@ export class WAStartupService {
           sqs.sendMessage(params, (err, data) => {
             if (err) {
               this.logger.error({
-                local: WAStartupService.name + '.sendData-SQS',
+                local: ChannelStartupService.name + '.sendData-SQS',
                 message: err?.message,
                 hostName: err?.hostname,
                 code: err?.code,
@@ -808,7 +887,7 @@ export class WAStartupService {
             } else {
               if (this.configService.get<Log>('LOG').LEVEL.includes('WEBHOOKS')) {
                 const logData = {
-                  local: WAStartupService.name + '.sendData-SQS',
+                  local: ChannelStartupService.name + '.sendData-SQS',
                   event,
                   instance: this.instance.name,
                   data,
@@ -852,7 +931,7 @@ export class WAStartupService {
 
         if (this.configService.get<Log>('LOG').LEVEL.includes('WEBHOOKS')) {
           const logData = {
-            local: WAStartupService.name + '.sendData-WebsocketGlobal',
+            local: ChannelStartupService.name + '.sendData-WebsocketGlobal',
             event,
             instance: this.instance.name,
             data,
@@ -882,7 +961,7 @@ export class WAStartupService {
 
         if (this.configService.get<Log>('LOG').LEVEL.includes('WEBHOOKS')) {
           const logData = {
-            local: WAStartupService.name + '.sendData-Websocket',
+            local: ChannelStartupService.name + '.sendData-Websocket',
             event,
             instance: this.instance.name,
             data,
@@ -916,7 +995,7 @@ export class WAStartupService {
 
         if (this.configService.get<Log>('LOG').LEVEL.includes('WEBHOOKS')) {
           const logData = {
-            local: WAStartupService.name + '.sendDataWebhook-local',
+            local: ChannelStartupService.name + '.sendDataWebhook-local',
             url: baseURL,
             event,
             instance: this.instance.name,
@@ -956,7 +1035,7 @@ export class WAStartupService {
           }
         } catch (error) {
           this.logger.error({
-            local: WAStartupService.name + '.sendDataWebhook-local',
+            local: ChannelStartupService.name + '.sendDataWebhook-local',
             message: error?.message,
             hostName: error?.hostname,
             syscall: error?.syscall,
@@ -988,7 +1067,7 @@ export class WAStartupService {
 
         if (this.configService.get<Log>('LOG').LEVEL.includes('WEBHOOKS')) {
           const logData = {
-            local: WAStartupService.name + '.sendDataWebhook-global',
+            local: ChannelStartupService.name + '.sendDataWebhook-global',
             url: globalURL,
             event,
             instance: this.instance.name,
@@ -1027,7 +1106,7 @@ export class WAStartupService {
           }
         } catch (error) {
           this.logger.error({
-            local: WAStartupService.name + '.sendDataWebhook-global',
+            local: ChannelStartupService.name + '.sendDataWebhook-global',
             message: error?.message,
             hostName: error?.hostname,
             syscall: error?.syscall,
